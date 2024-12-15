@@ -25,7 +25,7 @@ class SpatialReceptiveField2d(torch.nn.Module):
     Example:
         >>> import torch
         >>> from norse.torch import SpatialReceptiveField2d
-        >>> parameters = torch.tensor([[1., 1., 1., 0., 0.]])
+        >>> parameters = torch.tensor([[1., 1., 1., 0., 0., 0., 0.]])
         >>> m = SpatialReceptiveField2d(1, 9, parameters)
         >>> m.weights.shape
         torch.Size([1, 1, 9, 9])
@@ -36,7 +36,7 @@ class SpatialReceptiveField2d(torch.nn.Module):
     Arguments:
         in_channels (int): Number of input channels
         size (int): Size of the receptive field
-        rf_parameters (torch.Tensor): Parameters for the receptive fields in the order (scale, angle, ratio, dx, dy)
+        rf_parameters (torch.Tensor): Parameters for the receptive fields in the order (scale, angle, ratio, x, y, dx, dy)
         aggregate (bool): If `True`, the receptive fields will be aggregated across channels. Defaults to `True`.
         domain (float): The domain of the receptive field. Defaults to `8`.
         optimize_fields (bool): If `True`, the `rf_parameters` will be optimized during training. Defaults to `True`.
@@ -51,13 +51,62 @@ class SpatialReceptiveField2d(torch.nn.Module):
         aggregate: bool = True,
         domain: float = 8,
         optimize_fields: bool = True,
+        optimize_log: bool = True,
         **kwargs,
     ) -> None:
         super().__init__()
-        self.rf_parameters = (
-            torch.nn.Parameter(rf_parameters) if optimize_fields else rf_parameters
+
+        self.optimize_log = optimize_log
+        self.optimize_fields = optimize_fields
+        if optimize_fields:
+            if not self.optimize_log:
+                self.register_parameter(
+                    "rf_parameters",
+                    torch.nn.Parameter(rf_parameters),
+                )
+            else:
+                log_scales = torch.log(rf_parameters[:, 0])
+                log_ratios = torch.log(rf_parameters[:, 2])
+                log_rf_parameters = torch.cat(
+                    (
+                        torch.stack(
+                            (log_scales, rf_parameters[:, 1], log_ratios), dim=1
+                        ),
+                        rf_parameters[:, 3:],
+                    ),
+                    dim=1,
+                )
+                self.register_parameter(
+                    "log_rf_parameters",
+                    torch.nn.Parameter(log_rf_parameters),
+                )
+                self.register_buffer(
+                    "rf_parameters",
+                    torch.cat(
+                        (
+                            torch.stack(
+                                (
+                                    torch.exp(self.log_rf_parameters[:, 0]),
+                                    self.log_rf_parameters[:, 1],
+                                    torch.exp(self.log_rf_parameters[:, 2]),
+                                ),
+                                dim=1,
+                            ),
+                            self.log_rf_parameters[:, 3:],
+                        ),
+                        dim=1,
+                    ),
+                )
+        else:
+            self.register_buffer(
+                "rf_parameters",
+                rf_parameters,
+            )
+
+        self.register_buffer(
+            "rf_parameters_previous",
+            torch.zeros_like(self.rf_parameters),
         )
-        self.rf_parameters_previous = torch.zeros_like(self.rf_parameters)
 
         self.in_channels = in_channels
         self.size = size
@@ -83,37 +132,59 @@ class SpatialReceptiveField2d(torch.nn.Module):
 
             self.register_full_backward_hook(update_hook)
 
+    def _set_weights(self, weights):
+        if hasattr(self, "weights"):
+            self.weights = weights
+        else:
+            self.register_buffer("weights", weights)
+
+    def _exp_log_rf_parameters(self):
+        return torch.cat(
+            (
+                torch.stack(
+                    (
+                        torch.exp(self.log_rf_parameters[:, 0]),
+                        self.log_rf_parameters[:, 1],
+                        torch.exp(self.log_rf_parameters[:, 2]),
+                    ),
+                    dim=1,
+                ),
+                self.log_rf_parameters[:, 3:],
+            ),
+            dim=1,
+        )
+
     def _update_weights(self):
         if self.has_updated:
-            if not torch.all(torch.eq(self.rf_parameters_previous, self.rf_parameters)):
-                # Reset the flag
-                self.has_updated = False
-                self.rf_parameters_previous = self.rf_parameters.detach().clone()
-                # Calculate new weights
-                fields = spatial_receptive_fields_with_derivatives(
-                    self.rf_parameters,
-                    size=self.size,
-                    domain=self.domain,
+            # Reset the flag
+            self.has_updated = False
+            if self.optimize_fields and self.optimize_log:
+                self.rf_parameters = self._exp_log_rf_parameters()
+            self.rf_parameters_previous = self.rf_parameters.detach().clone()
+            # Calculate new weights
+            fields = spatial_receptive_fields_with_derivatives(
+                self.rf_parameters,
+                size=self.size,
+                domain=self.domain,
+            )
+            if self.aggregate:
+                self.out_channels = fields.shape[0]
+                self._set_weights(fields.unsqueeze(1).repeat(1, self.in_channels, 1, 1))
+            else:
+                self.out_channels = self.fields.shape[0] * self.in_channels
+                empty_weights = torch.zeros(
+                    self.in_channels,
+                    fields.shape[0],
+                    self.size,
+                    self.size,
+                    device=self.rf_parameters.device,
                 )
-                if self.aggregate:
-                    self.out_channels = fields.shape[0]
-                    self.weights = fields.unsqueeze(1).repeat(1, self.in_channels, 1, 1)
-                else:
-                    self.out_channels = self.fields.shape[0] * self.in_channels
-                    empty_weights = torch.zeros(
-                        self.in_channels,
-                        fields.shape[0],
-                        self.size,
-                        self.size,
-                        device=self.rf_parameters.device,
-                    )
-                    weights = []
-                    for i in range(self.in_channels):
-                        in_weights = empty_weights.clone()
-                        in_weights[i] = fields
-                        weights.append(in_weights)
-                    self.weights = torch.concat(weights, 1).permute(1, 0, 2, 3)
-                self.weights.requires_grad_(True)
+                weights = []
+                for i in range(self.in_channels):
+                    in_weights = empty_weights.clone()
+                    in_weights[i] = fields
+                    weights.append(in_weights)
+                self._set_weights(torch.concat(weights, 1).permute(1, 0, 2, 3))
 
     def forward(self, x: torch.Tensor):
         self._update_weights()  # Update weights if necessary
@@ -123,8 +194,8 @@ class SpatialReceptiveField2d(torch.nn.Module):
 class SampledSpatialReceptiveField2d(torch.nn.Module):
     """
     Creates a spatial receptive field as 2-dimensional convolutions, sampled over a set of scales,
-    angles, ratios, and derivatives.
-    This module allows for the optimization of the input parameters for scales, angles, and ratios
+    angles, ratios, x, y and derivatives.
+    This module allows for the optimization of the input parameters for scales, angles, ratios, x and y
     (not derivatives) and will update the parameters (and, by extension, the receptive fields) accordingly
     if the respective parameters are set to True.
     This module is a wrapper around the `SpatialReceptiveField2d` module and will forward the kwargs.
@@ -135,10 +206,13 @@ class SampledSpatialReceptiveField2d(torch.nn.Module):
         >>> scales = torch.tensor([1.0, 2.0])
         >>> angles = torch.tensor([0.0, 1.0])
         >>> ratios = torch.tensor([0.5, 1.0])
+        >>> x = torch.tensor([0.0, 1.0])
+        >>> y = torch.tensor([0.0, 1.0])
         >>> derivatives = torch.tensor([[0, 0]])
-        >>> m = SampledSpatialReceptiveField2d(1, 9, scales, angles, ratios, derivatives,
+        >>> m = SampledSpatialReceptiveField2d(1, 9, scales, angles, ratios, derivatives, x, y,
         >>>                                    optimize_scales=False, optimize_angles=False,
-        >>>                                    optimize_ratios=True)
+        >>>                                    optimize_ratios=True, optimize_x=False,
+        >>>                                    optimize_y=False))
         >>> optim = torch.optim.SGD(list(m.parameters()), lr=1)
         >>> y = m(torch.ones(1, 1, 9, 9))
         >>> y.sum().backward()
@@ -154,30 +228,68 @@ class SampledSpatialReceptiveField2d(torch.nn.Module):
         angles: torch.Tensor,
         ratios: torch.Tensor,
         derivatives: torch.Tensor,
+        x: torch.Tensor = torch.Tensor([0.0]),
+        y: torch.Tensor = torch.Tensor([0.0]),
         optimize_scales: bool = True,
         optimize_angles: bool = True,
         optimize_ratios: bool = True,
+        optimize_x: bool = True,
+        optimize_y: bool = True,
+        optimize_log: bool = True,
         **kwargs,
     ):
         super().__init__()
-        self.scales = torch.nn.Parameter(scales) if optimize_scales else scales
+
+        x = x.to(scales.device)
+        y = y.to(scales.device)
+        self.optimize_log = optimize_log
+        if not self.optimize_log:
+            self.scales = torch.nn.Parameter(scales) if optimize_scales else scales
+            self.ratios = torch.nn.Parameter(ratios) if optimize_ratios else ratios
+        else:
+            self.log_scales = (
+                torch.nn.Parameter(torch.log(scales))
+                if optimize_scales
+                else torch.log(scales)
+            )
+            self.log_ratios = (
+                torch.nn.Parameter(torch.log(ratios))
+                if optimize_ratios
+                else torch.log(ratios)
+            )
+            self.scales = torch.exp(self.log_scales)
+            self.ratios = torch.exp(self.log_ratios)
+
         self.angles = torch.nn.Parameter(angles) if optimize_angles else angles
-        self.ratios = torch.nn.Parameter(ratios) if optimize_ratios else ratios
+        self.x = torch.nn.Parameter(x) if optimize_x else x
+        self.y = torch.nn.Parameter(y) if optimize_y else y
 
         self.derivatives = derivatives
-        self.has_updated = False
+        self.has_updated = True
 
         self.submodule = SpatialReceptiveField2d(
             in_channels=in_channels,
             size=size,
             rf_parameters=spatial_parameters(
-                self.scales, self.angles, self.ratios, self.derivatives
+                self.scales,
+                self.angles,
+                self.ratios,
+                self.derivatives,
+                self.x,
+                self.y,
             ),
             optimize_fields=False,
+            optimize_log=False,
             **kwargs,
         )
 
-        if optimize_angles or optimize_scales or optimize_ratios:
+        if (
+            optimize_angles
+            or optimize_scales
+            or optimize_ratios
+            or optimize_x
+            or optimize_y
+        ):
 
             def update_hook(m, gi, go):
                 self.has_updated = True
@@ -190,8 +302,11 @@ class SampledSpatialReceptiveField2d(torch.nn.Module):
 
     def _update_weights(self):
         if self.has_updated:
+            if self.optimize_log:
+                self.scales = torch.exp(self.log_scales)
+                self.ratios = torch.exp(self.log_ratios)
             self.submodule.rf_parameters = spatial_parameters(
-                self.scales, self.angles, self.ratios, self.derivatives
+                self.scales, self.angles, self.ratios, self.derivatives, self.x, self.y
             )
             self.submodule.has_updated = True
             self.submodule._update_weights()
@@ -200,9 +315,9 @@ class SampledSpatialReceptiveField2d(torch.nn.Module):
 class ParameterizedSpatialReceptiveField2d(torch.nn.Module):
     """
     A parameterized version of the `SpatialReceptiveField2d` module, where the scales, angles,
-    and ratios are optimized and updated for each kernel individually during training.
+    ratios, x and y are optimized and updated for each kernel individually during training.
     This is opposite to the `SampledSpatialReceptiveField2d` module, where the scales, angles,
-    and ratios are updated individually (as generating functions for the kernels).
+    ratios, x and y are updated individually (as generating functions for the kernels).
     This module wraps the `SpatialReceptiveField2d` module.
     This module is a wrapper around the `SpatialReceptiveField2d` module and will forward the kwargs.
 
@@ -212,9 +327,12 @@ class ParameterizedSpatialReceptiveField2d(torch.nn.Module):
         >>> scales = torch.tensor([1.0, 2.0])
         >>> angles = torch.tensor([0.0, 1.0])
         >>> ratios = torch.tensor([0.5, 1.0])
-        >>> m = ParameterizedSpatialReceptiveField2d(1, 9, scales, angles, ratios, 1,
+        >>> x = torch.tensor([0.0, 1.0])
+        >>> y = torch.tensor([0.0, 1.0])
+        >>> m = ParameterizedSpatialReceptiveField2d(1, 9, scales, angles, ratios, 1, x, y,
         >>>                                          optimize_scales=False, optimize_angles=False,
-        >>>                                          optimize_ratios=True)
+        >>>                                          optimize_ratios=True, optimize_x=True,
+        >>>                                          optimize_y=True)
 
     """
 
@@ -226,34 +344,70 @@ class ParameterizedSpatialReceptiveField2d(torch.nn.Module):
         angles: torch.Tensor,
         ratios: torch.Tensor,
         derivatives: torch.Tensor,
+        x: torch.Tensor = torch.Tensor([0.0]),
+        y: torch.Tensor = torch.Tensor([0.0]),
         optimize_scales: bool = True,
         optimize_angles: bool = True,
         optimize_ratios: bool = True,
+        optimize_x: bool = True,
+        optimize_y: bool = True,
+        optimize_log: bool = True,
         **kwargs,
     ):
         super().__init__()
-        self.initial_parameters = spatial_parameters(
-            scales, angles, ratios, derivatives
+        x = x.to(scales.device)
+        y = y.to(scales.device)
+        self.optimize_log = optimize_log
+        self.register_buffer(
+            "initial_parameters",
+            spatial_parameters(scales, angles, ratios, derivatives, x, y),
         )
-        self.scales = (
-            torch.nn.Parameter(self.initial_parameters[:, 0])
-            if optimize_scales
-            else self.initial_parameters[:, 0]
-        )
+        if self.optimize_log:
+            self.log_scales = (
+                torch.nn.Parameter(torch.log(self.initial_parameters[:, 0]))
+                if optimize_scales
+                else torch.log(self.initial_parameters[:, 0])
+            )
+            self.scales = torch.exp(self.log_scales)
+        else:
+            self.scales = (
+                torch.nn.Parameter(self.initial_parameters[:, 0])
+                if optimize_scales
+                else self.initial_parameters[:, 0]
+            )
         self.angles = (
             torch.nn.Parameter(self.initial_parameters[:, 1])
             if optimize_angles
             else self.initial_parameters[:, 1]
         )
-        self.ratios = (
-            torch.nn.Parameter(self.initial_parameters[:, 2])
-            if optimize_ratios
-            else self.initial_parameters[:, 2]
+        if optimize_log:
+            self.log_ratios = (
+                torch.nn.Parameter(torch.log(self.initial_parameters[:, 2]))
+                if optimize_ratios
+                else torch.log(self.initial_parameters[:, 2])
+            )
+            self.ratios = torch.exp(self.log_ratios)
+        else:
+            self.ratios = (
+                torch.nn.Parameter(self.initial_parameters[:, 2])
+                if optimize_ratios
+                else self.initial_parameters[:, 2]
+            )
+        self.x = (
+            torch.nn.Parameter(self.initial_parameters[:, 3])
+            if optimize_x
+            else self.initial_parameters[:, 3]
         )
+        self.y = (
+            torch.nn.Parameter(self.initial_parameters[:, 4])
+            if optimize_y
+            else self.initial_parameters[:, 4]
+        )
+
         rf_parameters = torch.concat(
             [
-                torch.stack([self.scales, self.angles, self.ratios], 1),
-                self.initial_parameters[:, 3:],
+                torch.stack([self.scales, self.angles, self.ratios, self.x, self.y], 1),
+                self.initial_parameters[:, 5:],
             ],
             1,
         )
@@ -262,11 +416,18 @@ class ParameterizedSpatialReceptiveField2d(torch.nn.Module):
             size=size,
             rf_parameters=rf_parameters,
             optimize_fields=False,
+            optimize_log=False,
             **kwargs,
         )
-        self.has_updated = False
+        self.has_updated = True
 
-        if optimize_angles or optimize_scales or optimize_ratios:
+        if (
+            optimize_angles
+            or optimize_scales
+            or optimize_ratios
+            or optimize_x
+            or optimize_y
+        ):
 
             def update_hook(m, gi, go):
                 self.has_updated = True
@@ -279,10 +440,15 @@ class ParameterizedSpatialReceptiveField2d(torch.nn.Module):
 
     def _update_weights(self):
         if self.has_updated:
+            if self.optimize_log:
+                self.scales = torch.exp(self.log_scales)
+                self.ratios = torch.exp(self.log_ratios)
             self.submodule.rf_parameters = torch.concat(
                 [
-                    torch.stack([self.scales, self.angles, self.ratios], 1),
-                    self.initial_parameters[:, 3:],
+                    torch.stack(
+                        [self.scales, self.angles, self.ratios, self.x, self.y], 1
+                    ),
+                    self.initial_parameters[:, 5:],
                 ],
                 1,
             )
