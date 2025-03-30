@@ -1,5 +1,34 @@
-# Example from norse documentation: Spiking Convolutional Classifier
-# Created by PeterC 28-04-2024
+"""
+This script demonstrates the implementation of a spiking convolutional classifier 
+using the Norse library for spiking neural networks. The model combines traditional 
+convolutional and pooling layers with spiking neuron layers to process input data.
+
+Modules:
+    - torch: PyTorch library for tensor computations and neural networks.
+    - norse.torch: Norse library for spiking neural network components.
+
+Classes and Functions:
+    - SequentialState: A sequential container for layers with stateful processing.
+    - LICell: A leaky integrator cell for non-spiking integration.
+    - LIFCell: A leaky integrate-and-fire cell for spiking activation.
+
+Model Architecture:
+    - Convolutional layers with 5x5 kernels and increasing channels (1 -> 20 -> 50).
+    - Spiking activation layers (LIFCell) after each convolutional layer.
+    - Max pooling layers to reduce spatial dimensions.
+    - Fully connected layer with 800 input units and 10 output units.
+    - Final non-spiking integrator layer (LICell).
+
+Example Usage:
+    - Random input data with shape (8, 1, 28, 28) is passed through the model.
+    - The model outputs a tuple containing:
+        - A tensor of shape (8, 10) representing the output for 8 timesteps.
+        - The internal state of the neurons.
+
+Note:
+    - This example is adapted from the Norse documentation and serves as a 
+      demonstration of spiking neural network capabilities.
+"""
 
 import torch, torch.nn as nn
 from norse.torch import LICell             # Leaky integrator
@@ -18,6 +47,6 @@ model = SequentialState(
     LICell(),                    # Non-spiking integrator layer
 )
 
-# RANDOM DATA
-data = torch.randn(8, 1, 28, 28) # 8 batches, 1 channel, 28x28 pixels
+# Random data to run model
+data = torch.randn(8, 1, 28, 28) # 8 timesteps, 1 channel, 28x28 pixels
 output, state = model(data)      # Provides a tuple (tensor (8, 10), neuron state)

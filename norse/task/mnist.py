@@ -198,6 +198,7 @@ def main(args):
         torch.backends.cudnn.benchmark = True
 
     device = torch.device(args.device)
+    print('Using device: ', device)
 
     kwargs = {"num_workers": 1, "pin_memory": True} if args.device == "cuda" else {}
     train_loader = torch.utils.data.DataLoader(
